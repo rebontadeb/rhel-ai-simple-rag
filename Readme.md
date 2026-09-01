@@ -182,7 +182,7 @@ sudo chmod -R 777 ~/rhel-ai-cache/ ~/rhel-ai-data/
 
 ```bash
 cd ~/rhel-ai-simple-rag
-podman build -t rhel-ai-app:latest .
+podman build -t quay.io/rebontadeb/sample-rhel-ai .
 ```
 
 Build takes 3-5 min first time (downloads pip packages).
@@ -197,7 +197,7 @@ podman run -d \
   --network=host \
   -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
   -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
-  rhel-ai-app:latest
+  quay.io/rebontadeb/sample-rhel-ai
 ```
 
 Verify:
@@ -572,7 +572,7 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 ```bash
 # build
-podman build -t rhel-ai-app:latest .
+podman build -t quay.io/rebontadeb/sample-rhel-ai .
 
 # fix volume ownership (uid 1001 = container user)
 mkdir -p ~/rhel-ai-cache/fastembed ~/rhel-ai-data/docs
@@ -585,18 +585,18 @@ podman run -d \
   --network=host \
   -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
   -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
-  rhel-ai-app:latest
+  quay.io/rebontadeb/sample-rhel-ai
 
 # logs
 podman logs -f rhel-ai-app
 
 # rebuild after code change
 podman rm -f rhel-ai-app
-podman build -t rhel-ai-app:latest .
+podman build -t quay.io/rebontadeb/sample-rhel-ai .
 podman run -d --name rhel-ai-app --network=host \
   -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
   -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
-  rhel-ai-app:latest
+  quay.io/rebontadeb/sample-rhel-ai
 
 # clear vector store
 podman exec rhel-ai-app python3 cleanup.py
