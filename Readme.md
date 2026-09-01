@@ -651,25 +651,3 @@ QUERY:
 | Answer uses general knowledge | Relevance filter `dist < 1.5` in `rag.py` |
 
 ---
-
-## Why No HuggingFace Token?
-
-RHEL AI ships with Granite pre-installed at:
-```
-~/.cache/instructlab/models/granite-3.1-8b-starter-v2/
-```
-
-`ilab model serve` loads it directly — no external download needed.
-
----
-
-## Why fastembed Instead of sentence-transformers?
-
-`sentence-transformers` pulls PyTorch + NVIDIA CUDA libs — 6GB+ unnecessary packages.
-`fastembed` uses ONNX runtime — 200MB total, CPU only, same embedding quality.
-
-| | sentence-transformers | fastembed |
-|---|---|---|
-| Size | ~7GB | ~200MB |
-| GPU needed | Yes (pulls CUDA) | No |
-| Quality | Good | Same |
