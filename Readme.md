@@ -173,9 +173,7 @@ Container runs as uid 1001. Host dirs must match:
 
 ```bash
 mkdir -p ~/rhel-ai-cache/fastembed ~/rhel-ai-data/docs
-sudo chown -R 1001:0 ~/rhel-ai-cache/
-sudo chown -R 1001:0 ~/rhel-ai-data/
-sudo chmod -R g+rwX ~/rhel-ai-cache/ ~/rhel-ai-data/
+sudo chmod -R 777 ~/rhel-ai-cache/ ~/rhel-ai-data/
 ```
 
 ---
