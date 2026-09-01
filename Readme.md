@@ -1,7 +1,9 @@
 # rhel-ai-app — Student Lab Guide
 
 > Build a fully local RAG chatbot on RHEL AI using Granite LLM, ChromaDB, and FastAPI.
-> No cloud. No OpenAI. Everything runs on-box.
+> No cloud. No OpenAI. No HuggingFace token. Everything runs on-box.
+
+**GitHub:** https://github.com/rebontadeb/rhel-ai-simple-rag
 
 ---
 
@@ -16,8 +18,9 @@ A web application where you:
 
 | Layer | Tool |
 |---|---|
-| LLM | IBM Granite 3.1 8B via Red Hat AI Inference Server (vLLM) |
-| Embedding | all-MiniLM-L6-v2 (sentence-transformers, CPU) |
+| LLM | IBM Granite 3.1 8B — pre-installed in RHEL AI |
+| Inference Server | ilab model serve (vLLM backend) |
+| Embedding | BAAI/bge-small-en-v1.5 via fastembed (ONNX, CPU, ~33MB) |
 | Vector Store | ChromaDB 1.0.0 |
 | PDF Extraction | pdfminer.six |
 | API | FastAPI + uvicorn |
@@ -26,80 +29,230 @@ A web application where you:
 
 ---
 
-## Prerequisites
+## Step 1 — Verify Environment
 
-- RHEL AI installed on an EC2 instance (or equivalent)
-- NVIDIA GPU (L4 or better recommended)
-- Podman installed
-- Python 3.9+
-- Red Hat Customer Portal account
-- HuggingFace account + API token
-
----
-
-## Project Structure
-
+```bash
+cat /etc/redhat-release
+lspci | grep -E -i "vga|3d|display|nvidia|amd|radeon"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+ilab --version
+podman --version
+python3 --version
+ls ~/.cache/instructlab/models/
 ```
-rhel-ai-app/
-├── config.py              ← all settings
-├── ingest.py              ← PDF → chunks → embeddings → ChromaDB
-├── rag.py                 ← query → retrieve → Granite → SSE stream
-├── main.py                ← FastAPI routes
-├── cleanup.py             ← clear vector store
-├── requirements.txt       ← Python dependencies
-├── Containerfile          ← builds app container image
-├── pod-start.sh           ← starts all 3 containers
-├── pod-stop.sh            ← stops everything
-├── static/                ← (empty, reserved for static files)
-├── data/docs/             ← uploaded PDFs land here
-├── vectorstore/           ← ChromaDB persistence
-└── templates/
-    └── index.html         ← HTMX chat UI
+
+Expected:
+```
+Red Hat Enterprise Linux release 9.4 (Plow)
+NVIDIA L4, 23034 MiB
+ilab, version 0.26.1
+podman version 4.9.4-rhel
+Python 3.9.18
+granite-3.1-8b-lab-v2    granite-3.1-8b-starter-v2 ...
 ```
 
 ---
 
-## Step 1 — Login to Red Hat Registry
+## Step 2 — Login to Red Hat Registry
 
 ```bash
 podman login registry.redhat.io
-# enter your Red Hat Customer Portal username and password
 ```
 
-Expected output:
+Expected:
 ```
 Login Succeeded!
 ```
 
 ---
 
-## Step 2 — Get a HuggingFace Token
-
-1. Go to https://huggingface.co/settings/tokens
-2. Click **New token** → Read access
-3. Copy the token
+## Step 3 — Init ilab
 
 ```bash
-echo "export HF_TOKEN=hf_your_token_here" > ~/private.env
-source ~/private.env
+ilab config init
+```
+
+When prompted:
+- Vendor → `1` (NVIDIA)
+- Profile → `0` (NO SYSTEM PROFILE) — single L4 not in list
+
+---
+
+## Step 4 — Fix ilab Config for Single L4 GPU
+
+Default config sets `tensor-parallel-size 4` — fails on 1 GPU. Default `max_model_len 131072` exceeds L4 KV cache. Run this patch:
+
+```bash
+python3 -c "
+import yaml
+with open('/var/home/cloud-user/.config/instructlab/config.yaml') as f:
+    config = yaml.safe_load(f)
+config['serve']['model_path'] = '/var/home/cloud-user/.cache/instructlab/models/granite-3.1-8b-starter-v2'
+config['serve']['vllm']['gpus'] = 1
+config['serve']['vllm']['vllm_args'] = [
+    '--max-model-len', '11680',
+    '--dtype', 'bfloat16'
+]
+with open('/var/home/cloud-user/.config/instructlab/config.yaml', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+print('Done')
+"
+```
+
+Verify:
+
+```bash
+grep -A5 "vllm:" ~/.config/instructlab/config.yaml | grep -E "gpus|max-model"
 ```
 
 ---
 
-## Step 3 — Create Project Directory
+## Step 5 — Serve Granite (keep terminal open)
 
 ```bash
-mkdir -p ~/rhel-ai-app/{static,data/docs,vectorstore,templates}
-cd ~/rhel-ai-app
+ilab model serve --gpus 1
+```
+
+Wait for:
+```
+INFO: Application startup complete.
+```
+
+Takes ~2 min (model cached), ~12 min cold start.
+
+In another terminal verify:
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+> ⚠ Do not close this terminal — keep ilab running. Use `nohup` for background:
+> ```bash
+> nohup ilab model serve --gpus 1 > ~/ilab-serve.log 2>&1 &
+> echo $! > ~/ilab-serve.pid
+> ```
+
+---
+
+## Step 6 — Start ChromaDB
+
+```bash
+mkdir -p ~/vectorstore
+
+podman run -d \
+  --name chroma \
+  -p 8001:8000 \
+  -v ~/vectorstore:/chroma/chroma \
+  chromadb/chroma
+
+curl http://localhost:8001/api/v2/heartbeat
+```
+
+Expected:
+```json
+{"nanosecond heartbeat": ...}
 ```
 
 ---
 
-## Step 4 — Create Application Files
+## Step 7 — Clone the App
 
-Create each file below inside `~/rhel-ai-app/`.
+```bash
+cd ~
+git clone https://github.com/rebontadeb/rhel-ai-simple-rag.git
+cd rhel-ai-simple-rag
+```
+
+Or create files manually — see **Application Code** section below.
 
 ---
+
+## Step 8 — Fix Ownership for Volume Mounts
+
+Container runs as uid 1001. Host dirs must match:
+
+```bash
+mkdir -p ~/rhel-ai-cache/fastembed ~/rhel-ai-data/docs
+sudo chown -R 1001:0 ~/rhel-ai-cache/
+sudo chown -R 1001:0 ~/rhel-ai-data/
+sudo chmod -R g+rwX ~/rhel-ai-cache/ ~/rhel-ai-data/
+```
+
+---
+
+## Step 9 — Build App Container
+
+```bash
+cd ~/rhel-ai-simple-rag
+podman build -t rhel-ai-app:latest .
+```
+
+Build takes 3-5 min first time (downloads pip packages).
+
+---
+
+## Step 10 — Run App Container
+
+```bash
+podman run -d \
+  --name rhel-ai-app \
+  --network=host \
+  -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
+  -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
+  rhel-ai-app:latest
+```
+
+Verify:
+
+```bash
+podman logs -f rhel-ai-app
+```
+
+Expected:
+```
+INFO: Application startup complete.
+INFO: Uvicorn running on http://0.0.0.0:8080
+```
+
+> ⚠ `--network=host` required — app reaches ilab on `localhost:8000` and ChromaDB on `localhost:8001`
+> ⚠ First run downloads fastembed model (~33MB) to mounted cache dir
+
+---
+
+## Step 11 — Access via SSH Tunnel
+
+Only SSH port is open externally. From your **local machine**:
+
+```bash
+ssh -L 9090:localhost:8080 cloud-user@<bastion-hostname>
+```
+
+Open browser: `http://localhost:9090`
+
+---
+
+## Step 12 — Use the App
+
+1. Click folder icon in sidebar → select PDF
+2. Click **Upload** — wait for `✓ N chunks ingested`
+3. Type question in chat → Enter
+4. Granite answers using only your document
+
+---
+
+## Step 13 — Stop Everything
+
+```bash
+podman stop rhel-ai-app chroma
+podman rm rhel-ai-app chroma
+
+# stop ilab
+kill $(cat ~/ilab-serve.pid)
+```
+
+---
+
+## Application Code
 
 ### `config.py`
 
@@ -107,8 +260,8 @@ Create each file below inside `~/rhel-ai-app/`.
 VLLM_URL = "http://localhost:8000/v1"
 CHROMA_HOST = "localhost"
 CHROMA_PORT = 8001
-EMBED_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "ibm-granite/granite-3.1-8b-instruct"
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"   # 33MB ONNX — no torch, no GPU
+LLM_MODEL = "granite-3.1-8b-starter-v2"
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 64
 TOP_K = 4
@@ -128,7 +281,7 @@ import os
 import re
 import uuid
 import chromadb
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from pdfminer.high_level import extract_text as pdfminer_extract
 from config import (
     CHROMA_HOST, CHROMA_PORT, EMBED_MODEL,
@@ -140,7 +293,10 @@ _embed_model = None
 def get_embed_model():
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = TextEmbedding(
+            model_name=EMBED_MODEL,
+            cache_dir="/opt/app-root/src/.cache"
+        )
     return _embed_model
 
 def get_chroma_collection():
@@ -179,7 +335,7 @@ def ingest_documents(file_path: str) -> dict:
         return {"status": "error", "message": "No text extracted"}
     chunks = chunk_text(text)
     model = get_embed_model()
-    embeddings = model.encode(chunks).tolist()
+    embeddings = [e.tolist() for e in model.embed(chunks)]
     collection = get_chroma_collection()
     filename = os.path.basename(file_path)
     ids = [str(uuid.uuid4()) for _ in chunks]
@@ -208,7 +364,7 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 import httpx
 import json
 import chromadb
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from config import (
     VLLM_URL, LLM_MODEL, TOP_K,
     CHROMA_HOST, CHROMA_PORT, CHROMA_COLLECTION, EMBED_MODEL
@@ -219,12 +375,15 @@ _embed_model = None
 def get_embed_model():
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = TextEmbedding(
+            model_name=EMBED_MODEL,
+            cache_dir="/opt/app-root/src/.cache"
+        )
     return _embed_model
 
 def retrieve_context(query: str):
     model = get_embed_model()
-    embedding = model.encode([query]).tolist()[0]
+    embedding = list(model.embed([query]))[0].tolist()
     client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
     collection = client.get_or_create_collection(CHROMA_COLLECTION)
     results = collection.query(
@@ -350,226 +509,17 @@ print("Cleared")
 ### `requirements.txt`
 
 ```
-fastapi==0.115.0
+fastapi==0.115.9
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 jinja2==3.1.4
 httpx==0.27.2
 pydantic==2.9.2
-sentence-transformers==2.7.0
+chromadb==1.0.0
+fastembed==0.3.1
+pdfminer.six
+pysqlite3-binary
 pypdf==4.3.1
-```
-
----
-
-### `templates/index.html`
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>rhel-ai-app</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    :root {
-      --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3e;
-      --accent: #cc0000; --accent-dim: #8b0000;
-      --text: #e8e8ec; --text-dim: #7a7d8e; --success: #3ecf8e;
-      --mono: 'JetBrains Mono', monospace; --sans: 'Inter', system-ui, sans-serif;
-    }
-    body { background: var(--bg); color: var(--text); font-family: var(--sans);
-      height: 100vh; display: grid;
-      grid-template-columns: 260px 1fr; grid-template-rows: 56px 1fr; }
-    header { grid-column: 1 / -1; background: var(--surface);
-      border-bottom: 1px solid var(--border); display: flex;
-      align-items: center; padding: 0 24px; gap: 12px; }
-    header .logo { width: 28px; height: 28px; background: var(--accent);
-      border-radius: 6px; display: flex; align-items: center;
-      justify-content: center; font-weight: 800; font-size: 14px; color: #fff; }
-    header h1 { font-size: 15px; font-weight: 600; color: var(--text); }
-    header span { font-size: 11px; color: var(--text-dim); background: var(--border);
-      padding: 2px 8px; border-radius: 100px; margin-left: auto; font-family: var(--mono); }
-    aside { background: var(--surface); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; padding: 20px 16px; gap: 16px; overflow-y: auto; }
-    aside h2 { font-size: 11px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.08em; color: var(--text-dim); }
-    .upload-zone { border: 1px dashed var(--border); border-radius: 8px;
-      padding: 16px; text-align: center; cursor: pointer; transition: border-color 0.2s; }
-    .upload-zone:hover { border-color: var(--accent); }
-    .upload-zone p { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
-    .upload-zone input { display: none; }
-    #upload-btn { width: 100%; padding: 8px; background: var(--accent); color: #fff;
-      border: none; border-radius: 6px; font-size: 13px; font-weight: 600;
-      cursor: pointer; transition: background 0.2s; }
-    #upload-btn:hover { background: var(--accent-dim); }
-    #upload-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    #upload-status { font-size: 11px; color: var(--success); min-height: 16px; font-family: var(--mono); }
-    .doc-list { display: flex; flex-direction: column; gap: 6px; }
-    .doc-item { font-size: 12px; color: var(--text-dim); padding: 6px 8px;
-      background: var(--bg); border-radius: 6px; border: 1px solid var(--border);
-      font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .doc-item::before { content: "📄 "; }
-    main { display: flex; flex-direction: column; overflow: hidden; }
-    #chat-history { flex: 1; overflow-y: auto; padding: 24px;
-      display: flex; flex-direction: column; gap: 16px; }
-    .msg { display: flex; flex-direction: column; gap: 4px; max-width: 780px; }
-    .msg.user { align-self: flex-end; align-items: flex-end; }
-    .msg.assistant { align-self: flex-start; }
-    .msg-label { font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
-      text-transform: uppercase; color: var(--text-dim); }
-    .msg-bubble { padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.65; }
-    .msg.user .msg-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
-    .msg.assistant .msg-bubble { background: var(--surface); border: 1px solid var(--border);
-      border-bottom-left-radius: 3px; color: var(--text); font-family: var(--sans);
-      white-space: pre-wrap; word-break: break-word; word-spacing: normal; letter-spacing: normal; }
-    .cursor { display: inline-block; width: 2px; height: 14px; background: var(--accent);
-      margin-left: 2px; animation: blink 1s step-end infinite; vertical-align: middle; }
-    @keyframes blink { 50% { opacity: 0; } }
-    .input-bar { padding: 16px 24px; border-top: 1px solid var(--border);
-      background: var(--surface); display: flex; gap: 10px; align-items: flex-end; }
-    #query-input { flex: 1; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px;
-      font-family: var(--sans); resize: none; outline: none; max-height: 120px;
-      transition: border-color 0.2s; }
-    #query-input:focus { border-color: var(--accent); }
-    #query-input::placeholder { color: var(--text-dim); }
-    #send-btn { padding: 10px 20px; background: var(--accent); color: #fff; border: none;
-      border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer;
-      transition: background 0.2s; white-space: nowrap; }
-    #send-btn:hover { background: var(--accent-dim); }
-    #send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center;
-      justify-content: center; gap: 12px; color: var(--text-dim); }
-    .empty-state .icon { font-size: 40px; }
-    ::-webkit-scrollbar { width: 4px; }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-  </style>
-</head>
-<body>
-<header>
-  <div class="logo">R</div>
-  <h1>rhel-ai-app</h1>
-  <span>Granite · RAG · vLLM</span>
-</header>
-<aside>
-  <h2>Documents</h2>
-  <div class="upload-zone" onclick="document.getElementById('file-input').click()">
-    <div style="font-size:24px">📂</div>
-    <p>Click to upload PDF or TXT</p>
-    <input type="file" id="file-input" accept=".pdf,.txt,.md" onchange="handleUpload(this)"/>
-  </div>
-  <button id="upload-btn" disabled>Upload</button>
-  <div id="upload-status"></div>
-  <h2>Ingested</h2>
-  <div class="doc-list" id="doc-list">
-    {% for doc in docs %}
-    <div class="doc-item" title="{{ doc }}">{{ doc }}</div>
-    {% else %}
-    <div style="font-size:12px; color: var(--text-dim)">No docs yet.</div>
-    {% endfor %}
-  </div>
-</aside>
-<main>
-  <div id="chat-history">
-    <div class="empty-state" id="empty-state">
-      <div class="icon">🔍</div>
-      <p>Upload a document, then ask anything.</p>
-    </div>
-  </div>
-  <div class="input-bar">
-    <textarea id="query-input" rows="1" placeholder="Ask about your documents..."
-      onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-    <button id="send-btn" onclick="sendQuery()">Ask</button>
-  </div>
-</main>
-<script>
-  let selectedFile = null;
-  function handleUpload(input) {
-    selectedFile = input.files[0];
-    if (selectedFile) {
-      document.getElementById('upload-btn').disabled = false;
-      document.getElementById('upload-status').textContent = selectedFile.name;
-    }
-  }
-  document.getElementById('upload-btn').addEventListener('click', async () => {
-    if (!selectedFile) return;
-    const btn = document.getElementById('upload-btn');
-    const status = document.getElementById('upload-status');
-    btn.disabled = true; btn.textContent = 'Ingesting...'; status.textContent = '';
-    const form = new FormData();
-    form.append('file', selectedFile);
-    try {
-      const res = await fetch('/ingest', { method: 'POST', body: form });
-      const data = await res.json();
-      if (data.status === 'ok') { status.textContent = `✓ ${data.chunks} chunks ingested`; refreshDocList(); }
-      else { status.textContent = `✗ ${data.message}`; }
-    } catch (e) { status.textContent = '✗ Upload failed'; }
-    finally { btn.textContent = 'Upload'; selectedFile = null; document.getElementById('file-input').value = ''; }
-  });
-  async function refreshDocList() {
-    const res = await fetch('/docs-list');
-    const data = await res.json();
-    const list = document.getElementById('doc-list');
-    list.innerHTML = data.docs.length
-      ? data.docs.map(d => `<div class="doc-item" title="${d}">${d}</div>`).join('')
-      : '<div style="font-size:12px; color: var(--text-dim)">No docs yet.</div>';
-  }
-  function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuery(); } }
-  function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
-  function appendMessage(role, text) {
-    const history = document.getElementById('chat-history');
-    document.getElementById('empty-state')?.remove();
-    const wrap = document.createElement('div');
-    wrap.className = `msg ${role}`;
-    wrap.innerHTML = `<div class="msg-label">${role === 'user' ? 'You' : 'Granite'}</div><div class="msg-bubble">${text}</div>`;
-    history.appendChild(wrap);
-    history.scrollTop = history.scrollHeight;
-    return wrap.querySelector('.msg-bubble');
-  }
-  async function sendQuery() {
-    const input = document.getElementById('query-input');
-    const btn = document.getElementById('send-btn');
-    const query = input.value.trim();
-    if (!query) return;
-    input.value = ''; input.style.height = 'auto'; btn.disabled = true;
-    appendMessage('user', query);
-    const bubble = appendMessage('assistant', '');
-    const cursor = document.createElement('span');
-    cursor.className = 'cursor';
-    bubble.appendChild(cursor);
-    try {
-      const res = await fetch('/ask', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query })
-      });
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '', fullText = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.startsWith('data:')) continue;
-          const raw = line.slice(5);
-          if (raw.trim() === '[DONE]') break;
-          fullText += raw;
-          cursor.previousSibling?.remove();
-          bubble.insertBefore(document.createTextNode(fullText), cursor);
-          document.getElementById('chat-history').scrollTop = 99999;
-        }
-      }
-    } catch (e) {
-      bubble.insertBefore(document.createTextNode('Error connecting to server.'), cursor);
-    } finally { cursor.remove(); btn.disabled = false; }
-  }
-</script>
-</body>
-</html>
 ```
 
 ---
@@ -580,12 +530,31 @@ pypdf==4.3.1
 FROM registry.access.redhat.com/ubi9/python-39:latest
 
 USER root
-RUN dnf install -y gcc make && dnf clean all
+
+RUN dnf install -y gcc make && dnf clean all && \
+    mkdir -p /opt/app-root/src/data/docs \
+             /opt/app-root/src/vectorstore \
+             /opt/app-root/src/static \
+             /opt/app-root/src/templates \
+             /opt/app-root/src/.tmp \
+             /opt/app-root/src/.cache && \
+    chown -R 1001:0 /opt/app-root/src && \
+    rm -rf /var/cache/dnf
+
 USER 1001
 
 WORKDIR /opt/app-root/src
 
+ENV TMPDIR=/opt/app-root/src/.tmp
+ENV PIP_NO_CACHE_DIR=1
+ENV FASTEMBED_CACHE_PATH=/opt/app-root/src/.cache
+
 COPY --chown=1001:0 requirements.txt .
+
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt && \
+    rm -rf /opt/app-root/src/.tmp/*
+
 COPY --chown=1001:0 config.py .
 COPY --chown=1001:0 main.py .
 COPY --chown=1001:0 ingest.py .
@@ -594,13 +563,6 @@ COPY --chown=1001:0 cleanup.py .
 COPY --chown=1001:0 templates/ templates/
 COPY --chown=1001:0 static/ static/
 
-RUN mkdir -p data/docs vectorstore
-
-RUN pip install --upgrade pip && \
-    pip install pysqlite3-binary pdfminer.six && \
-    pip install -r requirements.txt && \
-    pip install "chromadb==1.0.0"
-
 EXPOSE 8080
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
@@ -608,162 +570,42 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 ---
 
-### `pod-start.sh`
+## Run Commands Reference
 
 ```bash
-#!/bin/bash
-set -e
-
-POD_NAME="rhel-ai-pod"
-HF_TOKEN="${HF_TOKEN:-}"
-
-if [ -z "$HF_TOKEN" ]; then
-  echo "ERROR: HF_TOKEN not set. Run: source ~/private.env"
-  exit 1
-fi
-
-echo "==> Creating pod..."
-podman pod create \
-  --name "$POD_NAME" \
-  -p 8080:8080 \
-  -p 8000:8000 \
-  -p 8001:8001 \
-  2>/dev/null || echo "Pod already exists, continuing..."
-
-# 1. ChromaDB
-echo "==> Starting ChromaDB..."
-mkdir -p ~/vectorstore
-podman run -d \
-  --pod "$POD_NAME" \
-  --name chroma \
-  -v ~/vectorstore:/chroma/chroma \
-  chromadb/chroma 2>/dev/null || echo "chroma already running"
-
-sleep 3
-echo "    ChromaDB: $(curl -s http://localhost:8001/api/v2/heartbeat)"
-
-# 2. Granite / vLLM
-echo "==> Starting Granite (first run ~5 min)..."
-mkdir -p ~/rhaiis-cache ~/rhaiis-cache/.config
-podman run -d \
-  --pod "$POD_NAME" \
-  --name granite-server \
-  --device nvidia.com/gpu=all \
-  --security-opt=label=disable \
-  --shm-size=4g \
-  --userns=keep-id:uid=1001 \
-  --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN" \
-  --env "HF_HUB_OFFLINE=0" \
-  --env "VLLM_NO_USAGE_STATS=1" \
-  --mount type=tmpfs,destination=/tmp,tmpfs-mode=1777 \
-  -v ~/rhaiis-cache:/opt/app-root/src/.cache:Z \
-  -v ~/rhaiis-cache/.config:/opt/app-root/src/.config:Z \
-  registry.redhat.io/rhaiis/vllm-cuda-rhel9:3.2.2 \
-  --model ibm-granite/granite-3.1-8b-instruct \
-  --max-model-len 27680 2>/dev/null || echo "granite-server already running"
-
-until curl -s http://localhost:8000/v1/models | grep -q "granite"; do
-  sleep 15; echo "    Still loading..."
-done
-echo "    Granite: UP"
-
-# 3. rhel-ai-app
-echo "==> Building and starting rhel-ai-app..."
+# build
 podman build -t rhel-ai-app:latest .
+
+# fix volume ownership (uid 1001 = container user)
+mkdir -p ~/rhel-ai-cache/fastembed ~/rhel-ai-data/docs
+sudo chown -R 1001:0 ~/rhel-ai-cache/ ~/rhel-ai-data/
+sudo chmod -R g+rwX ~/rhel-ai-cache/ ~/rhel-ai-data/
+
+# run
 podman run -d \
-  --pod "$POD_NAME" \
   --name rhel-ai-app \
-  rhel-ai-app:latest 2>/dev/null || echo "rhel-ai-app already running"
+  --network=host \
+  -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
+  -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
+  rhel-ai-app:latest
 
-sleep 3
-echo ""
-echo "==> All done!"
-podman ps --pod
-echo ""
-echo "==> App URL: http://localhost:8080"
-echo "==> SSH tunnel: ssh -L 9090:localhost:8080 cloud-user@<your-bastion>"
-```
-
----
-
-### `pod-stop.sh`
-
-```bash
-#!/bin/bash
-echo "==> Stopping pod..."
-podman pod stop rhel-ai-pod
-podman pod rm rhel-ai-pod
-echo "==> Done. Data in ~/vectorstore preserved."
-```
-
----
-
-## Step 5 — Run Everything
-
-```bash
-cd ~/rhel-ai-app
-source ~/private.env
-chmod +x pod-start.sh pod-stop.sh
-./pod-start.sh
-```
-
----
-
-## Step 6 — Access the App
-
-Only SSH port is open externally. Use SSH tunnel from your local machine:
-
-```bash
-ssh -L 9090:localhost:8080 cloud-user@<your-bastion-hostname>
-```
-
-Open browser: `http://localhost:9090`
-
----
-
-## Step 7 — Use the App
-
-1. Click the folder icon in the sidebar
-2. Select a PDF from your computer
-3. Click **Upload** — wait for "✓ N chunks ingested"
-4. Type a question in the chat bar
-5. Press Enter or click **Ask**
-6. Granite answers using only your document
-
----
-
-## Step 8 — Stop Everything
-
-```bash
-./pod-stop.sh
-```
-
----
-
-## Useful Commands
-
-```bash
-# check all containers
-podman ps --pod
-
-# watch Granite startup logs
-podman logs -f granite-server
-
-# watch app logs
+# logs
 podman logs -f rhel-ai-app
 
-# clear vector store and re-ingest
-python3 cleanup.py
-
-# rebuild app after code change
+# rebuild after code change
 podman rm -f rhel-ai-app
 podman build -t rhel-ai-app:latest .
-podman run -d --pod rhel-ai-pod --name rhel-ai-app rhel-ai-app:latest
+podman run -d --name rhel-ai-app --network=host \
+  -v ~/rhel-ai-cache/fastembed:/opt/app-root/src/.cache:Z \
+  -v ~/rhel-ai-data/docs:/opt/app-root/src/data/docs:Z \
+  rhel-ai-app:latest
 
-# test via curl
-curl -X POST http://localhost:8080/ask \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is this document about?"}'
+# clear vector store
+podman exec rhel-ai-app python3 cleanup.py
+
+# SSH tunnel to browser
+ssh -L 9090:localhost:8080 cloud-user@<bastion-hostname>
+# open: http://localhost:9090
 ```
 
 ---
@@ -779,21 +621,20 @@ curl -X POST http://localhost:8080/ask \
 
 ---
 
-## How RAG Works (Concept)
+## How RAG Works
 
 ```
 INGEST:
-  PDF → extract text → split into chunks → embed each chunk
-      → store (chunk + embedding) in ChromaDB
+  PDF → pdfminer extracts text → split into 512-char chunks
+      → fastembed ONNX embeds each chunk (384-dim vector)
+      → store (chunk + vector) in ChromaDB
 
 QUERY:
-  Question → embed question → find similar chunks in ChromaDB
-           → send chunks + question to Granite
-           → Granite answers using only those chunks
-           → stream tokens back to browser
+  Question → embed → similarity search in ChromaDB (top 4)
+           → build prompt: "Answer ONLY using this context"
+           → send to Granite via ilab/vLLM (stream=True)
+           → tokens stream via SSE → browser renders in real-time
 ```
-
-The key insight: Granite never sees the full document. It only sees the most relevant chunks retrieved by similarity search. This keeps responses accurate and grounded.
 
 ---
 
@@ -801,12 +642,36 @@ The key insight: Granite never sees the full document. It only sees the most rel
 
 | Problem | Fix |
 |---|---|
-| `podman login` fails | Use Red Hat Customer Portal credentials, not email |
-| Granite exits immediately | Check `podman logs granite-server` for error |
-| `No usable temporary directory` | Add `--mount type=tmpfs,destination=/tmp,tmpfs-mode=1777` |
-| `KV cache not enough memory` | Add `--max-model-len 27680` |
-| `chromadb sqlite3 error` | `pip install pysqlite3-binary` — already in Containerfile |
-| `resolution-too-deep` pip error | Pin all versions in requirements.txt |
-| Port 8080 not accessible | Use SSH tunnel: `ssh -L 9090:localhost:8080 ...` |
-| `[DONE]` visible in response | UI bug — trim check on SSE `[DONE]` token |
-| Answer uses general knowledge | Check relevance filter `dist < 1.5` in `rag.py` |
+| `podman login` fails | Use Red Hat Customer Portal credentials |
+| ilab tensor-parallel error | Patch config: `gpus=1`, remove `tensor-parallel-size 4` |
+| KV cache error | Set `--max-model-len 11680` in ilab config vllm_args |
+| `No usable temporary directory` | `TMPDIR=/opt/app-root/src/.tmp` in Containerfile |
+| `Permission denied: .cache` | `sudo chown -R 1001:0 ~/rhel-ai-cache/` |
+| chromadb sqlite3 error | `pysqlite3-binary` in requirements.txt |
+| Port not accessible externally | SSH tunnel: `ssh -L 9090:localhost:8080 ...` |
+| fastembed download fails | Check volume ownership and network access |
+| Answer uses general knowledge | Relevance filter `dist < 1.5` in `rag.py` |
+
+---
+
+## Why No HuggingFace Token?
+
+RHEL AI ships with Granite pre-installed at:
+```
+~/.cache/instructlab/models/granite-3.1-8b-starter-v2/
+```
+
+`ilab model serve` loads it directly — no external download needed.
+
+---
+
+## Why fastembed Instead of sentence-transformers?
+
+`sentence-transformers` pulls PyTorch + NVIDIA CUDA libs — 6GB+ unnecessary packages.
+`fastembed` uses ONNX runtime — 200MB total, CPU only, same embedding quality.
+
+| | sentence-transformers | fastembed |
+|---|---|---|
+| Size | ~7GB | ~200MB |
+| GPU needed | Yes (pulls CUDA) | No |
+| Quality | Good | Same |
