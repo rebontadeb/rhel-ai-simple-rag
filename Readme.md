@@ -4,7 +4,7 @@
 > No cloud. No OpenAI. No HuggingFace token. Everything runs on-box.
 
 **GitHub:** https://github.com/rebontadeb/rhel-ai-simple-rag
-
+![Flow Diagram](architecture_diagram.png)
 ---
 
 ## What You Will Build
