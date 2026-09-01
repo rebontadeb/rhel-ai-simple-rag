@@ -1,7 +1,7 @@
 VLLM_URL = "http://localhost:8000/v1"
 CHROMA_HOST = "localhost"
 CHROMA_PORT = 8001
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"   # fastembed default — 33MB ONNX, no torch
 LLM_MODEL = "granite-3.1-8b-starter-v2"
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 64

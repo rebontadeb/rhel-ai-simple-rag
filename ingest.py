@@ -5,7 +5,7 @@ import os
 import re
 import uuid
 import chromadb
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from pdfminer.high_level import extract_text as pdfminer_extract
 from config import (
     CHROMA_HOST, CHROMA_PORT, EMBED_MODEL,
@@ -17,7 +17,7 @@ _embed_model = None
 def get_embed_model():
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = TextEmbedding(model_name=EMBED_MODEL)
     return _embed_model
 
 def get_chroma_collection():
@@ -25,20 +25,14 @@ def get_chroma_collection():
     return client.get_or_create_collection(CHROMA_COLLECTION)
 
 def clean_text(text: str) -> str:
-    """Clean extracted text."""
-    # fix ligatures
     text = text.replace('\ufb01', 'fi').replace('\ufb02', 'fl')
     text = text.replace('\ufb00', 'ff').replace('\ufb03', 'ffi').replace('\ufb04', 'ffl')
-    # rejoin hyphenated line breaks
     text = re.sub(r'-\n([a-z])', r'\1', text)
-    # collapse multiple spaces
     text = re.sub(r'[ \t]+', ' ', text)
-    # collapse excessive newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 def extract_text(file_path: str) -> str:
-    """Extract text from PDF or plain text file."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
         text = pdfminer_extract(file_path)
@@ -48,7 +42,6 @@ def extract_text(file_path: str) -> str:
             return f.read()
 
 def chunk_text(text: str) -> list:
-    """Split text into overlapping chunks."""
     chunks = []
     start = 0
     while start < len(text):
@@ -58,40 +51,25 @@ def chunk_text(text: str) -> list:
     return [c for c in chunks if len(c) > 50]
 
 def ingest_documents(file_path: str) -> dict:
-    """Ingest single file into ChromaDB."""
     text = extract_text(file_path)
     if not text.strip():
         return {"status": "error", "message": "No text extracted"}
-
     chunks = chunk_text(text)
     model = get_embed_model()
-    embeddings = model.encode(chunks).tolist()
-
+    embeddings = list(model.embed(chunks))
+    embeddings = [e.tolist() for e in embeddings]
     collection = get_chroma_collection()
     filename = os.path.basename(file_path)
-
     ids = [str(uuid.uuid4()) for _ in chunks]
     metadatas = [{"file_name": filename} for _ in chunks]
-
-    collection.add(
-        ids=ids,
-        documents=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-
+    collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
     return {"status": "ok", "chunks": len(chunks), "docs": 1}
 
 def list_ingested_docs() -> list:
-    """Return unique source filenames from ChromaDB."""
     try:
         collection = get_chroma_collection()
         results = collection.get(include=["metadatas"])
-        sources = list({
-            m.get("file_name", "unknown")
-            for m in results["metadatas"]
-            if m
-        })
+        sources = list({m.get("file_name", "unknown") for m in results["metadatas"] if m})
         return sorted(sources)
     except Exception:
         return []

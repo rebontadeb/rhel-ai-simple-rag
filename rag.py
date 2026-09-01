@@ -4,7 +4,7 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 import httpx
 import json
 import chromadb
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from config import (
     VLLM_URL, LLM_MODEL, TOP_K,
     CHROMA_HOST, CHROMA_PORT, CHROMA_COLLECTION, EMBED_MODEL
@@ -15,17 +15,14 @@ _embed_model = None
 def get_embed_model():
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = TextEmbedding(model_name=EMBED_MODEL)
     return _embed_model
 
 def retrieve_context(query: str):
-    """Embed query, retrieve top-k chunks from ChromaDB."""
     model = get_embed_model()
-    embedding = model.encode([query]).tolist()[0]
-
+    embedding = list(model.embed([query]))[0].tolist()
     client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
     collection = client.get_or_create_collection(CHROMA_COLLECTION)
-
     results = collection.query(
         query_embeddings=[embedding],
         n_results=TOP_K,
@@ -33,9 +30,7 @@ def retrieve_context(query: str):
     )
     docs = results["documents"][0] if results["documents"] else []
     distances = results["distances"][0] if results["distances"] else []
-    # filter out low relevance chunks (distance > 1.5 = not relevant)
-    filtered = [doc for doc, dist in zip(docs, distances) if dist < 1.5]
-    return filtered
+    return [doc for doc, dist in zip(docs, distances) if dist < 1.5]
 
 def build_prompt(query: str, chunks: list) -> str:
     context = "\n\n---\n\n".join(chunks)
@@ -50,16 +45,12 @@ def build_prompt(query: str, chunks: list) -> str:
     )
 
 async def stream_rag_response(query: str):
-    """Retrieve context, call vLLM, stream tokens as SSE."""
     chunks = retrieve_context(query)
-
     if not chunks:
         yield "data: This information is not available in the provided documents.\n\n"
         yield "data: [DONE]\n\n"
         return
-
     prompt = build_prompt(query, chunks)
-
     payload = {
         "model": LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -67,11 +58,8 @@ async def stream_rag_response(query: str):
         "max_tokens": 1024,
         "temperature": 0.1,
     }
-
     async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream(
-            "POST", f"{VLLM_URL}/chat/completions", json=payload
-        ) as resp:
+        async with client.stream("POST", f"{VLLM_URL}/chat/completions", json=payload) as resp:
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
