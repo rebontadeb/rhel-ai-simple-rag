@@ -1,0 +1,10 @@
+VLLM_URL = "http://localhost:8000/v1"
+CHROMA_HOST = "localhost"
+CHROMA_PORT = 8001
+EMBED_MODEL = "all-MiniLM-L6-v2"
+LLM_MODEL = "ibm-granite/granite-3.1-8b-instruct"
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+TOP_K = 4
+DOCS_DIR = "data/docs"
+CHROMA_COLLECTION = "rhel-ai-docs"
